@@ -2,6 +2,7 @@ import torch
 
 from .callback import *
 from .helper import *
+from .metric import *
 
 from fastprogress.fastprogress import master_bar, progress_bar
 import warnings
@@ -9,14 +10,14 @@ import warnings
 device = torch.accelerator.current_accelerator().type if torch.accelerator.is_available() else "cpu"
 
 class Learner():
-    def __init__(self, model, optimizer, train_dls, valid_dls, loss_fn, metrics=[], compile_model=True, clip_grads=None):
+    def __init__(self, model, optimizer, train_dls, valid_dls, loss_fn, metrics=None, compile_model=True, clip_grads=None):
         self.model = model.to(device)
         if compile_model:
             self.model = torch.compile(self.model)
         self.optim = optimizer(self.model.parameters())
 
-        self.dls = train_dls
-        self.valid_dls = valid_dls
+        self.dl = train_dls
+        self.valid_dl = valid_dls
 
         self.loss_fn = loss_fn
         self.clip_grads = clip_grads
@@ -30,6 +31,15 @@ class Learner():
 
         self.cbs = []
 
+        self.loss_fn.learner = self
+        self.device = device
+
+        # For complex loss functions or
+        # other things that need to use
+        # the input or output
+        self.x = None
+        self.y = None
+
         ### Things for callbacks to use
         # Updated every batch
         self.lr = None
@@ -40,24 +50,39 @@ class Learner():
         self.valid_loss = None
 
         # Add callbacks
+        if metrics is None:
+            metrics = [LRMetric(), TrainLossMetric(), ValidLossMetric()]
+
         self.add_cb(RecorderCallback(metrics))
         self.add_cb(TrainEvalCallback())
         self.add_cb(StatusCallback())
 
+    def __call__(self, *args):
+        return self.model(*args)
+
+    def to(self, device):
+        self.device = device
+        self.model.to(device)
+        if self.x is not None:
+            self.x.to(device)
+        if self.y is not None:
+            self.y.to(device)
+
     def _run_epoch(self, curr_epoch):
-        for batch, (x, y) in enumerate(progress_bar(self.dls, parent=self.mb)):
+        for batch, (self.x, self.y) in enumerate(progress_bar(self.dl, parent=self.mb)):
             lr = self.schedule.get_last_lr()
             assert len(lr) == 1, "Schedule LR must have a length of one!"
             self.lr = lr[0]
 
             self._run_cbs("before_batch")
 
-            x, y = x.to(device), y.to(device)
+            self.x = self.x.to(self.device)
+            self.y = self.y.to(self.device)
 
             # Forward
-            with torch.autocast(device):
-                z = self.model(x)
-                loss = self.loss_fn(x, z, y)
+            with torch.autocast(device_type=self.device):
+                z = self.model(self.x)
+                loss = self.loss_fn(z, self.y)
 
             self.train_loss = loss.item()
 
@@ -73,20 +98,21 @@ class Learner():
 
     def _run_valid(self):
         total = 0
-        with torch.no_grad(), torch.autocast(device):
-            for x, y in progress_bar(self.valid_dls, parent=self.mb):
-                x, y = x.to(device), y.to(device)
+        with torch.no_grad(), torch.autocast(device_type=self.device):
+            for self.x, self.y in progress_bar(self.valid_dl, parent=self.mb):
+                self.x = self.x.to(self.device)
+                self.y = self.y.to(self.device)
 
                 # Forward
-                z = self.model(x)
-                total += self.loss_fn(x, z, y).item()
+                z = self.model(self.x)
+                total += self.loss_fn(z, self.y).item()
         self.valid_loss = total / self.valid_bs
 
     def fit_one_cycle(self, num_epochs, max_lr=1e-3, div=25, final_div=1e5) -> None:
         if max_lr >= 1e-2:
             warnings.warn("fit_one_cycle has high max_lr which could lead to gradient explosions! If loss becomes NaN, try again with a lower max LR.")
         self.schedule = torch.optim.lr_scheduler.OneCycleLR(
-            self.optim, steps_per_epoch=len(self.dls), epochs=num_epochs,
+            self.optim, steps_per_epoch=len(self.dl), epochs=num_epochs,
             max_lr=max_lr, div_factor=div, final_div_factor=final_div
         )
         self.fit(num_epochs, self_schedule=True)
@@ -124,7 +150,7 @@ class Learner():
         torch.save(self.model, path)
 
     def add_cb(self, cb):
-        cb.learner = self
+        cb.set_learner(self)
         for existing in self.cbs:
             if existing.name == cb.name:
                 raise RuntimeError("A callback with the same name already exists!")
@@ -133,22 +159,5 @@ class Learner():
 
     def _run_cbs(self, state: str):
         for cb in self.cbs:
-            if state == "before_fit":
-                cb._before_fit()
-            elif state == "before_train":
-                cb._before_train()
-            elif state == "before_valid":
-                cb._before_valid()
-            elif state == "before_batch":
-                cb._before_batch()
-
-            elif state == "after_fit":
-                cb._after_fit()
-            elif state == "after_train":
-                cb._after_train()
-            elif state == "after_valid":
-                cb._after_valid()
-            elif state == "after_batch":
-                cb._after_batch()
-            else:
-                raise RuntimeError("Attempted to run callbacks with bad location")
+            if hasattr(cb, state):
+                getattr(cb, state)()
