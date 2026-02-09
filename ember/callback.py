@@ -2,6 +2,8 @@ import time
 import matplotlib.pyplot as plt
 from torch.utils.tensorboard import SummaryWriter
 from dataclasses import dataclass
+import warnings
+import math
 
 from .helper import *
 from .metric import *
@@ -84,40 +86,28 @@ class RecorderCallback(Callback):
     def name(self):
         return "recorder"
 
-    def plot_loss(self):
-        has_recorded_train_loss = False
-        has_recorded_valid_loss = False
-        for m in self.metrics:
-            if m.name == "train loss":
-                has_recorded_train_loss = True
-            elif m.name == "valid loss":
-                has_recorded_valid_loss = True
-
-        assert has_recorded_train_loss
-        assert has_recorded_valid_loss
-
-
-        x = range(0, self.step)
+    def plot(self, *metric_names, y_label=None):
+        x = []
         y = []
-        valid_x = []
-        valid_y = []
 
-        for i in range(0, len(self.data)):
-            s = self.data[i]
-            if s.is_train:
-                y.append(s.metrics["train loss"])
-            else:
-                valid_x.append(i)
-                valid_y.append(s.metrics["valid loss"])
+        for m_name in metric_names:
+            m_x = []
+            m_y = []
+            for i in range(0, len(self.data)):
+                s = self.data[i]
+                if m_name in s.metrics:
+                    m_x.append(s.step)
+                    m_y.append(s.metrics[m_name])
+            x.append(m_x)
+            y.append(m_y)
 
-        print(f"Found {len(x)} train and {len(valid_x)} valid snapshots")
+        for m_x, m_y in zip(x, y):
+            plt.plot(m_x, m_y)
 
-        plt.plot(x, y)
-        plt.plot(valid_x, valid_y)
-
+        if y_label is None:
+            y_label = ''.join(f"{name}, " for name in metric_names)[:-2]
         plt.xlabel("Batch")
-        plt.ylabel("Loss (smoothed)")
-        plt.title("Training loss")
+        plt.ylabel(y_label)
         plt.grid(True)
 
         plt.show()
@@ -175,9 +165,12 @@ class StatusCallback(Callback):
         for m in self.learner.recorder.metrics:
             if m.do_reporting:
                 val = m.value
+                if not math.isfinite(val):
+                    warnings.warn(f"NaN metric: {m.name}")
+                    val = 0.0
                 num_dig = val // 10 + 1
                 max_len = self.items[m]
-                data.append(f"{val:<{max_len}.{int(max_len - num_dig - 2)}f}")
+                data.append(f"{val:<{max_len}.{max(int(max_len - num_dig - 2), 1)}f}")
 
         data.append(format_time(self.learner.recorder.elapsed))
 

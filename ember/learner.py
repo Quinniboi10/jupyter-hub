@@ -6,24 +6,33 @@ from .metric import *
 
 from fastprogress.fastprogress import master_bar, progress_bar
 import warnings
+import math
 
 device = torch.accelerator.current_accelerator().type if torch.accelerator.is_available() else "cpu"
 
 class Learner():
-    def __init__(self, model, optimizer, train_dls, valid_dls, loss_fn, metrics=None, compile_model=True, clip_grads=None):
-        self.model = model.to(device)
-        if compile_model:
-            self.model = torch.compile(self.model)
-        self.optim = optimizer(self.model.parameters())
+    def __init__(self, model, optimizer, train_dl, valid_dl, loss_fn, metrics=None, cbs=None, clip_grads=None, accum=1):
+        # model: the PyTorch model to train
+        # optimizer: the PyTorch optimizer to run
+        # train_dl: the PyTorch train dataloader
+        # valid_dl: the PyTorch valid dataloader
+        # loss_fn: An extension of nn.Module that implements forward(preds, targets)
+        # metrics = None: Which metrics to use; defaults to LR, train loss, valid loss
+        # cbs = None: Which callbacks to attach after Recorder and TrainEval; defaults to Status
+        # clip_grads = None: Clip gradients before optimizer.step(); defaults to None (off)
+        # accum = 1: How many batches to average loss across before running optimizer.step(). Simulates true_bs = train_bs * accum; defaults to 1
+        self.model = model
+        self.optim = optimizer
 
-        self.dl = train_dls
-        self.valid_dl = valid_dls
+        self.dl = train_dl
+        self.valid_dl = valid_dl
 
         self.loss_fn = loss_fn
         self.clip_grads = clip_grads
+        self.accum = accum
 
-        self.train_bs = len(train_dls)
-        self.valid_bs = len(valid_dls)
+        self.train_bs = len(train_dl)
+        self.valid_bs = len(valid_dl)
 
         self.n_epochs = None
 
@@ -34,11 +43,15 @@ class Learner():
         self.loss_fn.learner = self
         self.device = device
 
+        if accum > 1:
+            print("Simulating batch size of", train_dl.batch_size * accum)
+
         # For complex loss functions or
         # other things that need to use
         # the input or output
         self.x = None
         self.y = None
+        self.preds = None
 
         ### Things for callbacks to use
         # Updated every batch
@@ -53,9 +66,24 @@ class Learner():
         if metrics is None:
             metrics = [LRMetric(), TrainLossMetric(), ValidLossMetric()]
 
-        self.add_cb(RecorderCallback(metrics))
-        self.add_cb(TrainEvalCallback())
-        self.add_cb(StatusCallback())
+        if cbs is None:
+            cbs = [RecorderCallback(metrics), TrainEvalCallback(), StatusCallback()]
+
+        for cb in cbs:
+            try:
+                self.add_cb(cb)
+            except RuntimeError:
+                pass
+
+        # Try to add required callbacks and if they already exist then just keep moving
+        for cb in [RecorderCallback(metrics), TrainEvalCallback()]:
+            try:
+                self.add_cb(cb)
+            except RuntimeError:
+                pass
+
+        # Move to device
+        self.to(device)
 
     def __call__(self, *args):
         return self.model(*args)
@@ -67,8 +95,11 @@ class Learner():
             self.x.to(device)
         if self.y is not None:
             self.y.to(device)
+        if self.preds is not None:
+            self.preds.to(device)
 
     def _run_epoch(self, curr_epoch):
+        self.optim.zero_grad()
         for batch, (self.x, self.y) in enumerate(progress_bar(self.dl, parent=self.mb)):
             lr = self.schedule.get_last_lr()
             assert len(lr) == 1, "Schedule LR must have a length of one!"
@@ -76,43 +107,52 @@ class Learner():
 
             self._run_cbs("before_batch")
 
-            self.x = self.x.to(self.device)
-            self.y = self.y.to(self.device)
+            self.x = self.x.to(self.device, non_blocking=True)
+            self.y = self.y.to(self.device, non_blocking=True)
 
             # Forward
             with torch.autocast(device_type=self.device):
-                z = self.model(self.x)
-                loss = self.loss_fn(z, self.y)
+                self.preds = self.model(self.x)
+                loss = self.loss_fn(self.preds, self.y) / self.accum
 
-            self.train_loss = loss.item()
+            self.train_loss = loss.item() * self.accum
 
             # Backward
-            self.optim.zero_grad()
             loss.backward()
+            if (batch + 1) % self.accum == 0:
+                if self.clip_grads is not None:
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.clip_grads)
+                self.optim.step()
+                self.schedule.step()
+                self.optim.zero_grad()
+
+            self._run_cbs("after_batch")
+
+        remainder = (batch + 1) % self.accum
+        if remainder != 0:
             if self.clip_grads is not None:
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.clip_grads)
             self.optim.step()
             self.schedule.step()
-
-            self._run_cbs("after_batch")
+            self.optim.zero_grad()
 
     def _run_valid(self):
         total = 0
         with torch.no_grad(), torch.autocast(device_type=self.device):
             for self.x, self.y in progress_bar(self.valid_dl, parent=self.mb):
-                self.x = self.x.to(self.device)
-                self.y = self.y.to(self.device)
+                self.x = self.x.to(self.device, non_blocking=True)
+                self.y = self.y.to(self.device, non_blocking=True)
 
                 # Forward
-                z = self.model(self.x)
-                total += self.loss_fn(z, self.y).item()
+                self.preds = self.model(self.x)
+                total += self.loss_fn(self.preds, self.y).item()
         self.valid_loss = total / self.valid_bs
 
     def fit_one_cycle(self, num_epochs, max_lr=1e-3, div=25, final_div=1e5) -> None:
         if max_lr >= 1e-2:
             warnings.warn("fit_one_cycle has high max_lr which could lead to gradient explosions! If loss becomes NaN, try again with a lower max LR.")
         self.schedule = torch.optim.lr_scheduler.OneCycleLR(
-            self.optim, steps_per_epoch=len(self.dl), epochs=num_epochs,
+            self.optim, steps_per_epoch=math.ceil(len(self.dl) / self.accum), epochs=num_epochs,
             max_lr=max_lr, div_factor=div, final_div_factor=final_div
         )
         self.fit(num_epochs, self_schedule=True)
