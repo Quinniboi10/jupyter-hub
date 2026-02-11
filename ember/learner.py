@@ -71,10 +71,7 @@ class Learner():
             cbs = [RecorderCallback(metrics), TrainEvalCallback(), StatusCallback()]
 
         for cb in cbs:
-            try:
-                self.add_cb(cb)
-            except RuntimeError:
-                pass
+            self.add_cb(cb)
 
         # Try to add required callbacks and if they already exist then just keep moving
         for cb in [RecorderCallback(metrics), TrainEvalCallback()]:
@@ -114,9 +111,11 @@ class Learner():
             # Forward
             with torch.autocast(device_type=self.device):
                 self.preds = self.model(self.x)
-                loss = self.loss_fn(self.preds, self.y) / self.accum
+                raw_loss = self.loss_fn(self.preds, self.y)
+                loss = raw_loss / self.accum
 
-            self.train_loss = loss.item()
+            # Report the unscaled loss so train/valid are comparable
+            self.train_loss = raw_loss.item()
 
             # Backward
             loss.backward()
@@ -185,7 +184,7 @@ class Learner():
 
         self._run_cbs("after_fit")
 
-    def save(self, path: str):
+    def save(self, path: str, silent=False):
         p = pathlib.Path(path)
         if p.suffix != ".pt" and p.suffix != ".pth":
             p = p.with_suffix(".pt")
@@ -193,7 +192,8 @@ class Learner():
 
         torch.save(self.model.state_dict(), str(p))
 
-        print(f"Model saved to {p}")
+        if not silent:
+            print(f"Model saved to {p}")
 
     def export(self, path: str, *args):
         p = pathlib.Path(path)
@@ -213,7 +213,7 @@ class Learner():
         cb.set_learner(self)
         for existing in self.cbs:
             if existing.name == cb.name:
-                raise RuntimeError("A callback with the same name already exists!")
+                raise RuntimeError("A callback with the same name already exists! It's possible it was added previously, or by default.")
         setattr(self, cb.name, cb)
         self.cbs.append(cb)
 

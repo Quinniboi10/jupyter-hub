@@ -201,3 +201,18 @@ class TensorboardCallback(Callback):
                 self.writer.add_scalar(m.name, m.value, self.learner.recorder.step)
 
         self.writer.flush()
+
+# Save best model
+class SaveBestCallback(Callback):
+    def __init__(self, path: str, metric='valid loss'):
+        super().__init__()
+        self.path = path
+        self.best = float('inf')
+        self.metric = metric
+
+    def after_valid(self):
+        for m in self.learner.recorder.metrics:
+            if m.name == self.metric:
+                if m.value < self.best:
+                    self.learner.save(self.path, silent=True)
+                    self.best = m.value
