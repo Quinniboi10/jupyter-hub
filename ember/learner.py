@@ -7,6 +7,7 @@ from .metric import *
 from fastprogress.fastprogress import master_bar, progress_bar
 import warnings
 import math
+import pathlib
 
 device = torch.accelerator.current_accelerator().type if torch.accelerator.is_available() else "cpu"
 
@@ -92,11 +93,11 @@ class Learner():
         self.device = device
         self.model.to(device)
         if self.x is not None:
-            self.x.to(device)
+            self.x = self.x.to(device)
         if self.y is not None:
-            self.y.to(device)
+            self.y = self.y.to(device)
         if self.preds is not None:
-            self.preds.to(device)
+            self.preds = self.preds.to(device)
 
     def _run_epoch(self, curr_epoch):
         self.optim.zero_grad()
@@ -115,7 +116,7 @@ class Learner():
                 self.preds = self.model(self.x)
                 loss = self.loss_fn(self.preds, self.y) / self.accum
 
-            self.train_loss = loss.item() * self.accum
+            self.train_loss = loss.item()
 
             # Backward
             loss.backward()
@@ -185,9 +186,28 @@ class Learner():
         self._run_cbs("after_fit")
 
     def save(self, path: str):
-        if path[-4:] != ".pth":
-            path += ".pth"
-        torch.save(self.model, path)
+        p = pathlib.Path(path)
+        if p.suffix != ".pt" and p.suffix != ".pth":
+            p = p.with_suffix(".pt")
+        p.parent.mkdir(parents=True, exist_ok=True)
+
+        torch.save(self.model.state_dict(), str(p))
+
+        print(f"Model saved to {p}")
+
+    def export(self, path: str, *args):
+        p = pathlib.Path(path)
+        if p.suffix != ".pt2":
+            p = p.with_suffix(".pt2")
+        p.parent.mkdir(parents=True, exist_ok=True)
+
+        if not args:
+            x, _ = next(iter(self.valid_dl))
+            args = (x,)
+        exported = torch.export.export(self.model, args)
+        torch.export.save(exported, str(p))
+
+        print(f"Model exported to {p}")
 
     def add_cb(self, cb):
         cb.set_learner(self)
