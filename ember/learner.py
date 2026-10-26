@@ -252,3 +252,27 @@ class Learner():
         for cb in self.cbs:
             if hasattr(cb, state):
                 getattr(cb, state)()
+
+    def param_info(self, sort_by: Literal["order", "count"]="count") -> None:
+        """
+        Prints information about the model's parameters
+        """
+        total = sum(p.numel() for p in self.model.parameters())
+        trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+
+        print(f"Total:     {total:,}")
+        print(f"Trainable: {trainable:,}")
+
+        rows: list[list[str|int]] = []
+        for name, p in self.model.named_parameters():
+            rows.append([name, p.numel()])
+
+        if sort_by == "count":
+            rows.sort(key=lambda a: a[1], reverse=True)
+
+        for i in range(len(rows)):
+            rows[i][1] = f"{rows[i][1]:,}"
+
+        rows.insert(0, ["Name", "Parameters"])
+
+        tableify(rows)

@@ -27,6 +27,16 @@ def format_time(sec: float) -> str:
     r += f"{mins:02d}:{sec:02d}"
     return r
 
+def tableify(data: list[list[str]]) -> None:
+    cols = list(zip(*data))
+
+    spaces = [len(max(col, key=lambda a: len(a))) for col in cols]
+
+    for row in data:
+        for col_idx in range(len(cols)):
+            print(f"{row[col_idx]:<{spaces[col_idx]}}", end="  ")
+        print()
+
 class ExpMovingAvg():
     def __init__(self, k):
         self.k = k
