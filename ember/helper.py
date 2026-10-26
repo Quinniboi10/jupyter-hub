@@ -2,10 +2,11 @@ import re
 
 import inspect
 
-def get_line():
-    return inspect.currentframe().f_back.f_lineno
+def get_line() -> int:
+    frame = inspect.currentframe()
+    return frame.f_back.f_lineno if frame is not None and frame.f_back is not None else -1
 
-def format_time(sec):
+def format_time(sec: float) -> str:
     sec = round(sec)
 
     days = sec // 60 // 60 // 24
@@ -32,13 +33,13 @@ class ExpMovingAvg():
         self.avg = 0
         self.num = 0
 
-    def step(self, new_value) -> None:
+    def step(self, new_value: float) -> None:
         self.num += 1
         self.avg = self.avg + (new_value - self.avg) / min(self.num, self.k)
 
     def get(self) -> float:
         return self.avg
 
-def camel_to_snake(name):
+def camel_to_snake(name: str) -> str:
     name = re.sub('(.)([A-Z][a-z]+)', r'\1_\2', name)
     return re.sub('([a-z0-9])([A-Z])', r'\1_\2', name).lower()

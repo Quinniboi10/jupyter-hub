@@ -2,11 +2,15 @@ import time
 import matplotlib.pyplot as plt
 from torch.utils.tensorboard import SummaryWriter
 from dataclasses import dataclass
+from typing import cast, TYPE_CHECKING, Literal
 import warnings
 import math
 
 from .helper import *
 from .metric import *
+
+if TYPE_CHECKING:
+    from .learner import Learner
 
 '''
 Valid callback positions
@@ -26,7 +30,8 @@ AFTER_BATCH
 # callbacks must inheret
 class Callback():
     def __init__(self):
-        self.learner = None
+        # Can't use the usual cast() trick becasue Learner would be a circular import
+        self.learner: Learner = None # pyright: ignore[reportAttributeAccessIssue]
 
     def __repr__(self):
         return type(self).__name__
@@ -48,6 +53,13 @@ class TrainEvalCallback(Callback):
     def before_valid(self):
         self.learner.model.eval()
 
+# Switches the learner.state
+class StateCallback(Callback):
+    def before_train(self):
+        self.learner.state = State.TRAIN
+    def before_valid(self):
+        self.learner.state = State.VALID
+
 # Records useful information about the
 # learner as it runs. Some metrics are
 # required for correct function of other
@@ -58,14 +70,14 @@ class TrainEvalCallback(Callback):
 #    self.time: float    - time of the snapshot since start of training
 #    self.step: int      - number of steps recorded at time of snapshot
 #    self.metrics: dict  - (metric, value) pairs
-#    self.is_train: bool - was this snapshot taken during train or valid
+#    self.state: State   - the learner's state when the snapshot was taken
 class RecorderCallback(Callback):
     @dataclass
     class Snapshot():
         elapsed: float
         step: int
         metrics: dict
-        is_train: bool
+        state: State
 
     def __init__(self, metrics):
         super().__init__()
@@ -75,7 +87,7 @@ class RecorderCallback(Callback):
 
         self.data = []
 
-        self.start = None
+        self.start = cast(float, None)
 
     def set_learner(self, learner):
         self.learner = learner
@@ -86,7 +98,7 @@ class RecorderCallback(Callback):
     def name(self):
         return "recorder"
 
-    def plot(self, *metric_names, y_label=None):
+    def plot(self, *metric_names, y_label=None, units: Literal["batch", "epoch"]="epoch"):
         x = []
         y = []
 
@@ -101,27 +113,32 @@ class RecorderCallback(Callback):
             x.append(m_x)
             y.append(m_y)
 
+        if units == "epoch":
+            for m_x in x:
+                for i in range(len(m_x)):
+                    m_x[i] /= self.learner.num_train_batches
+
         for m_x, m_y in zip(x, y):
             plt.plot(m_x, m_y)
 
         if y_label is None:
-            y_label = ''.join(f"{name}, " for name in metric_names)[:-2]
-        plt.xlabel("Batch")
+            y_label = ', '.join(name for name in metric_names)
+        plt.xlabel(units)
         plt.ylabel(y_label)
         plt.grid(True)
 
         plt.show()
 
-    def _collect_metrics(self, is_train):
+    def _collect_metrics(self, state: State):
         metrics = {}
 
         for m in self.metrics:
-            if m.is_train == is_train:
+            if m.state == self.learner.state == state:
                 value = m.value
                 if value is not None:
                     metrics[m.name] = value
 
-        self.data.append(self.Snapshot(self.elapsed, self.step, metrics, is_train))
+        self.data.append(self.Snapshot(self.elapsed, self.step, metrics, self.learner.state))
 
     @property
     def elapsed(self):
@@ -131,13 +148,16 @@ class RecorderCallback(Callback):
         self.start = time.time()
 
     def after_batch(self):
+        if self.learner.state != State.TRAIN:
+            return
+
         for m in self.metrics:
             m.step()
-        self._collect_metrics(True)
+        self._collect_metrics(State.TRAIN)
         self.step += 1
 
     def after_valid(self):
-        self._collect_metrics(False)
+        self._collect_metrics(State.VALID)
 
 # Displays training status through
 # fastprogressbar and prints info
@@ -190,14 +210,16 @@ class TensorboardCallback(Callback):
 
     def after_batch(self):
         for m in self.learner.recorder.metrics:
-            if m.is_train:
+            m: Metric
+            if m.state == State.TRAIN:
                 self.writer.add_scalar(m.name, m.value, self.learner.recorder.step)
 
         self.writer.flush()
 
     def after_valid(self):
         for m in self.learner.recorder.metrics:
-            if not m.is_train:
+            m: Metric
+            if m.state == State.VALID:
                 self.writer.add_scalar(m.name, m.value, self.learner.recorder.step)
 
         self.writer.flush()

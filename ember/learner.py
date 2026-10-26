@@ -1,3 +1,5 @@
+from torch.utils.data import DataLoader
+from torch import nn
 import torch
 
 from .callback import *
@@ -8,20 +10,27 @@ from fastprogress.fastprogress import master_bar, progress_bar
 import warnings
 import math
 import pathlib
+from typing import cast, Optional
 
-device = torch.accelerator.current_accelerator().type if torch.accelerator.is_available() else "cpu"
+device = torch.accelerator.current_accelerator().type if torch.accelerator.is_available() else "cpu" # pyright: ignore[reportOptionalMemberAccess]
 
 class Learner():
-    def __init__(self, model, optimizer, train_dl, valid_dl, loss_fn, metrics=None, cbs=None, clip_grads=None, accum=1):
-        # model: the PyTorch model to train
-        # optimizer: the PyTorch optimizer to run
-        # train_dl: the PyTorch train dataloader
-        # valid_dl: the PyTorch valid dataloader
-        # loss_fn: An extension of nn.Module that implements forward(preds, targets)
-        # metrics = None: Which metrics to use; defaults to LR, train loss, valid loss
-        # cbs = None: Which callbacks to attach after Recorder and TrainEval; defaults to Status
-        # clip_grads = None: Clip gradients before optimizer.step(); defaults to None (off)
-        # accum = 1: How many batches to average loss across before running optimizer.step(). Simulates true_bs = train_bs * accum; defaults to 1
+    # Type hints on required CBs
+    recorder: RecorderCallback
+
+    def __init__(self, model: nn.Module, optimizer: torch.optim.Optimizer, train_dl: DataLoader, valid_dl: DataLoader, loss_fn: nn.Module, metrics: Optional[list[Metric]]=None, cbs: Optional[list[Callback]]=None, clip_grads: Optional[float]=0, accum: int=1):
+        """
+        Args:
+            model: the PyTorch model to train
+            optimizer: the PyTorch optimizer to run
+            train_dl: the PyTorch train dataloader
+            valid_dl: the PyTorch valid dataloader
+            loss_fn: An extension of nn.Module that implements forward(preds, targets)
+            metrics: Which metrics to use apart from LR, train loss, valid loss
+            cbs: Which callbacks to attach after Recorder, TrainEval, State; defaults to Status (None)
+            clip_grads: Clip gradients before optimizer.step(); defaults to off (None)
+            accum: How many batches to average loss across before running optimizer.step(). Simulates true_bs = train_bs * accum
+        """
         self.model = model
         self.optim = optimizer
 
@@ -32,49 +41,66 @@ class Learner():
         self.clip_grads = clip_grads
         self.accum = accum
 
-        self.train_bs = len(train_dl)
-        self.valid_bs = len(valid_dl)
+        self.num_train_batches = len(train_dl)
+        self.num_valid_batches = len(valid_dl)
 
-        self.n_epochs = None
+        assert isinstance(train_dl.batch_size, int)
+        assert isinstance(valid_dl.batch_size, int)
 
-        self.schedule = None
+        self.train_bs = train_dl.batch_size
+        self.valid_bs = valid_dl.batch_size
 
-        self.cbs = []
+
+        self.n_epochs = cast(int, None)
+
+        self.schedule = cast(torch.optim.lr_scheduler.LRScheduler, None)
+
+        self.cbs: list[Callback] = []
 
         self.loss_fn.learner = self
         self.device = device
 
+        assert train_dl.batch_size
+
         if accum > 1:
             print("Simulating batch size of", train_dl.batch_size * accum)
+
+        # Shows the current state of the learner as it trains
+        self.state = cast(State, None)
 
         # For complex loss functions or
         # other things that need to use
         # the input or output
-        self.x = None
-        self.y = None
-        self.preds = None
+        self.x = cast(torch.Tensor, None)
+        self.y = cast(torch.Tensor, None)
+        self.preds = cast(torch.Tensor, None)
 
         ### Things for callbacks to use
         # Updated every batch
-        self.lr = None
-        self.train_loss = None
+        self.lr = cast(float, None)
+        self.train_loss = cast(float, None)
 
         # Updated every epoch
         self.epoch = 0
-        self.valid_loss = None
+        self.valid_loss = cast(float, None)
 
-        # Add callbacks
+        # Add callbacks and metrics
         if metrics is None:
-            metrics = [LRMetric(), TrainLossMetric(), ValidLossMetric()]
+            metrics = []
+
+        # Always-on metrics
+        for m in reversed([LRMetric(), TrainLossMetric(), ValidLossMetric()]):
+            if m not in metrics:
+                metrics.insert(0, m)
 
         if cbs is None:
-            cbs = [RecorderCallback(metrics), TrainEvalCallback(), StatusCallback()]
+            cbs = [StatusCallback()]
 
         for cb in cbs:
             self.add_cb(cb)
 
         # Try to add required callbacks and if they already exist then just keep moving
-        for cb in [RecorderCallback(metrics), TrainEvalCallback()]:
+        for cb in [RecorderCallback(metrics), TrainEvalCallback(), StateCallback()]:
             try:
                 self.add_cb(cb)
             except RuntimeError:
@@ -102,6 +128,7 @@ class Learner():
             lr = self.schedule.get_last_lr()
             assert len(lr) == 1, "Schedule LR must have a length of one!"
             self.lr = lr[0]
+            assert isinstance(self.lr, float), f"LR Scheduler get_last_lr() expected return type list[float] with length 1, got {type(self.lr)}"
 
             self._run_cbs("before_batch")
 
@@ -140,13 +167,16 @@ class Learner():
         total = 0
         with torch.no_grad(), torch.autocast(device_type=self.device):
             for self.x, self.y in progress_bar(self.valid_dl, parent=self.mb):
+                self._run_cbs("before_batch")
+
                 self.x = self.x.to(self.device, non_blocking=True)
                 self.y = self.y.to(self.device, non_blocking=True)
 
                 # Forward
                 self.preds = self.model(self.x)
                 total += self.loss_fn(self.preds, self.y).item()
-        self.valid_loss = total / self.valid_bs
+                self._run_cbs("after_batch")
+        self.valid_loss = total / self.num_valid_batches
 
     def fit_one_cycle(self, num_epochs, max_lr=1e-3, div=25, final_div=1e5) -> None:
         if max_lr >= 1e-2:
@@ -158,6 +188,7 @@ class Learner():
         self.fit(num_epochs, self_schedule=True)
 
     def fit(self, num_epochs, self_schedule=False):
+        assert num_epochs > 0, "Cannot train for less than 1 epoch"
         self.mb = master_bar(range(num_epochs))
         if self_schedule == False:
             self.schedule = torch.optim.lr_scheduler.ConstantLR(

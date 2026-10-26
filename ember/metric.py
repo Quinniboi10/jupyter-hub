@@ -2,9 +2,15 @@ import torch
 
 from .helper import *
 
+from enum import Enum, auto
+
+class State(Enum):
+    TRAIN = auto()
+    VALID = auto()
+
 # Base class for a metric
 class Metric():
-    is_train = False    # If True, the metric will be recorded every batch, otherwise after every epoch
+    state = State.TRAIN    # State of the learner in which to run step()
     do_reporting = True # If True, the metric will be printed by StatusCallback
     name = "Metric base class"
 
@@ -39,7 +45,7 @@ class ExpAvgMetric(Metric):
 
 
 class LRMetric(Metric):
-    is_train = True
+    state = State.TRAIN
     do_reporting = False
     name = "lr"
 
@@ -48,7 +54,7 @@ class LRMetric(Metric):
         return self.learner.lr
 
 class TrainLossMetric(ExpAvgMetric):
-    is_train = True
+    state = State.TRAIN
     do_reporting = True
     name = "train loss"
 
@@ -56,7 +62,7 @@ class TrainLossMetric(ExpAvgMetric):
         self.avg.step(self.learner.train_loss)
 
 class ValidLossMetric(Metric):
-    is_train = False
+    state = State.VALID
     do_reporting = True
     name = "valid loss"
 
@@ -65,7 +71,7 @@ class ValidLossMetric(Metric):
         return self.learner.valid_loss
 
 class OutputVarianceMetric(ExpAvgMetric):
-    is_train = True
+    state = State.TRAIN
     do_reporting = True
     name = "pred variance"
 
