@@ -10,9 +10,16 @@ class State(Enum):
 
 # Base class for a metric
 class Metric():
-    state = State.TRAIN    # State of the learner in which to run step()
+    state = State.TRAIN # State of the learner in which to run step()
     do_reporting = True # If True, the metric will be printed by StatusCallback
     name = "Metric base class"
+
+    def __eq__(self, other) -> bool:
+        assert isinstance(other, Metric)
+        return self.name == other.name
+
+    def __hash__(self) -> int:
+        return hash(self.name)
 
     def set_learner(self, learner):
         self.learner = learner

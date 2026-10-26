@@ -79,7 +79,7 @@ class RecorderCallback(Callback):
         metrics: dict
         state: State
 
-    def __init__(self, metrics):
+    def __init__(self, metrics: list[Metric]):
         super().__init__()
         self.metrics = metrics
 
@@ -165,7 +165,7 @@ class RecorderCallback(Callback):
 class StatusCallback(Callback):
     def before_fit(self):
         header = ["epoch"]
-        self.items = {
+        self.items: dict[str | Metric, int] = {
             "epoch": 5,
             "time": 11
         }
@@ -210,7 +210,6 @@ class TensorboardCallback(Callback):
 
     def after_batch(self):
         for m in self.learner.recorder.metrics:
-            m: Metric
             if m.state == State.TRAIN:
                 self.writer.add_scalar(m.name, m.value, self.learner.recorder.step)
 
@@ -218,7 +217,6 @@ class TensorboardCallback(Callback):
 
     def after_valid(self):
         for m in self.learner.recorder.metrics:
-            m: Metric
             if m.state == State.VALID:
                 self.writer.add_scalar(m.name, m.value, self.learner.recorder.step)
 
